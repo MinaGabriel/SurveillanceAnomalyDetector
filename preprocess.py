@@ -244,3 +244,323 @@ best_model.load_state_dict(torch.load(best_model_path))
 best_model.to(device)
 best_model.eval()
 # Now best_model holds the best model state
+
+
+
+
+
+
+
+
+import torch.nn as nn
+import torchvision.models as models
+
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size):
+        super(ConvLSTMCell, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.gates = nn.Conv2d(in_channels=input_channels + hidden_channels,
+                               out_channels=4 * hidden_channels,  # for input, forget, cell, and output gates
+                               kernel_size=kernel_size,
+                               padding=self.padding)
+
+    def forward(self, input_tensor, hidden_state):
+        h_cur, c_cur = hidden_state
+        #print("[input_tensor, h_cur]", [input_tensor.size(), h_cur.size()])
+        # concatenate along the channel dimension
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        #print("[combined]", combined.size())
+        #print("input_channels + hidden_channels" , self.input_channels + self.hidden_channels)
+        gates = self.gates(combined)
+        #print("[combined, gates]", [combined.size(), gates.size()])
+        # Split the combined gate tensor into its components
+        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, 1)
+        #print("[input_gate, forget_gate, cell_gate, output_gate]", [input_gate.size(), forget_gate.size(), cell_gate.size(), output_gate.size()])
+
+        input_gate = torch.sigmoid(input_gate)
+        forget_gate = torch.sigmoid(forget_gate)
+        cell_gate = torch.tanh(cell_gate)
+        output_gate = torch.sigmoid(output_gate)
+
+        c_next = forget_gate * c_cur + input_gate * cell_gate
+        h_next = output_gate * torch.tanh(c_next)
+        #print("[h_next, c_next]", [h_next.size(), c_next.size()])
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_channels, height, width, device=self.gates.weight.device),
+                torch.zeros(batch_size, self.hidden_channels, height, width, device=self.gates.weight.device))
+
+
+class ConvLSTM_VGG19(nn.Module):
+    def __init__(self):
+        super(ConvLSTM_VGG19, self).__init__()
+
+        # Load pre-trained VGG19 model
+        vgg19 = models.vgg19(pretrained=True).features
+        
+        # freeze all layers
+        for param in vgg19.parameters():
+            param.requires_grad = False
+            
+        '''
+        num_layers = len(vgg19)
+        for layer in vgg19[:num_layers // 2]:  # Freeze the first half
+            for param in layer.parameters():
+                param.requires_grad = False 
+                '''
+        self.vgg19_features = vgg19
+        
+        self.convlstm1 = ConvLSTMCell(input_channels=512, hidden_channels=64, kernel_size=3) # Adjust the input_channels based on VGG19 output
+        self.convlstm2 = ConvLSTMCell(input_channels=64, hidden_channels=32, kernel_size=3)
+        self.convlstm3 = ConvLSTMCell(input_channels=32, hidden_channels=64, kernel_size=3)
+
+        # Spatial Decoder
+        
+        self.decoder = nn.Sequential(
+                    # Start with the last VGG19 feature size and work backwards
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64),
+                    nn.ConvTranspose2d(in_channels=64, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    
+                    
+                    nn.ConvTranspose2d(in_channels=512, out_channels=256, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    
+                    
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=3,stride=1, padding=1),
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(128), 
+                    
+                    nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=3,stride=1, padding=1),
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64), 
+                    nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64), 
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ConvTranspose2d(in_channels=64, out_channels=3, kernel_size=3,stride=1, padding=1),
+                )
+        
+
+    def forward(self, x):
+        b, seq_len, _, h, w = x.size()
+        
+        h1, c1 = self.convlstm1.init_hidden(b, (8, 8)) # Adjust the size as per the VGG19 output
+        h2, c2 = self.convlstm2.init_hidden(b, (8, 8))
+        h3, c3 = self.convlstm3.init_hidden(b, (8, 8))
+
+        output_sequence = []
+
+        for t in range(seq_len):
+            # Pass through the VGG19 spatial encoder
+            xt = self.vgg19_features(x[:, t]) 
+            #print(xt.shape)
+            # Temporal Encoder
+            h1, c1 = self.convlstm1(xt, (h1, c1))
+            h2, c2 = self.convlstm2(h1, (h2, c2))
+            h3, c3 = self.convlstm3(h2, (h3, c3))
+            
+            # Spatial Decoder 
+            xt = self.decoder(h1)
+
+            xt = torch.sigmoid(xt) 
+            output_sequence.append(xt.unsqueeze(1))
+
+        output_sequence = torch.cat(output_sequence, dim=1)
+        return output_sequence
+            
+
+model = ConvLSTM_VGG19()
+image = torch.randn(1, 10, 3, 256, 256)
+
+output = model(image)
+print(output.size())
+
+
+
+
+
+import torch.nn as nn
+import torchvision.models as models
+
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size):
+        super(ConvLSTMCell, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.gates = nn.Conv2d(in_channels=input_channels + hidden_channels,
+                               out_channels=4 * hidden_channels,  # for input, forget, cell, and output gates
+                               kernel_size=kernel_size,
+                               padding=self.padding)
+
+    def forward(self, input_tensor, hidden_state):
+        h_cur, c_cur = hidden_state
+        #print("[input_tensor, h_cur]", [input_tensor.size(), h_cur.size()])
+        # concatenate along the channel dimension
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        #print("[combined]", combined.size())
+        #print("input_channels + hidden_channels" , self.input_channels + self.hidden_channels)
+        gates = self.gates(combined)
+        #print("[combined, gates]", [combined.size(), gates.size()])
+        # Split the combined gate tensor into its components
+        input_gate, forget_gate, cell_gate, output_gate = gates.chunk(4, 1)
+        #print("[input_gate, forget_gate, cell_gate, output_gate]", [input_gate.size(), forget_gate.size(), cell_gate.size(), output_gate.size()])
+
+        input_gate = torch.sigmoid(input_gate)
+        forget_gate = torch.sigmoid(forget_gate)
+        cell_gate = torch.tanh(cell_gate)
+        output_gate = torch.sigmoid(output_gate)
+
+        c_next = forget_gate * c_cur + input_gate * cell_gate
+        h_next = output_gate * torch.tanh(c_next)
+        #print("[h_next, c_next]", [h_next.size(), c_next.size()])
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_channels, height, width, device=self.gates.weight.device),
+                torch.zeros(batch_size, self.hidden_channels, height, width, device=self.gates.weight.device))
+
+
+class ConvLSTM_VGG19(nn.Module):
+    def __init__(self):
+        super(ConvLSTM_VGG19, self).__init__()
+
+        # Load pre-trained VGG19 model
+        vgg19 = models.vgg19(pretrained=True).features
+        
+        # freeze all layers
+        for param in vgg19.parameters():
+            param.requires_grad = False
+            
+        '''
+        num_layers = len(vgg19)
+        for layer in vgg19[:num_layers // 2]:  # Freeze the first half
+            for param in layer.parameters():
+                param.requires_grad = False 
+                '''
+        self.vgg19_features = vgg19
+        
+        self.convlstm1 = ConvLSTMCell(input_channels=512, hidden_channels=64, kernel_size=3) # Adjust the input_channels based on VGG19 output
+        self.convlstm2 = ConvLSTMCell(input_channels=64, hidden_channels=32, kernel_size=3)
+        self.convlstm3 = ConvLSTMCell(input_channels=32, hidden_channels=64, kernel_size=3)
+
+        # Spatial Decoder
+        
+        self.decoder = nn.Sequential(
+                    # Start with the last VGG19 feature size and work backwards
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64),
+                    nn.ConvTranspose2d(in_channels=64, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(512),
+                    nn.ConvTranspose2d(in_channels=512, out_channels=256, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(256), 
+                    nn.ConvTranspose2d(in_channels=256, out_channels=128, kernel_size=3,stride=1, padding=1),
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(128), 
+                    nn.ConvTranspose2d(in_channels=128, out_channels=128, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(128), 
+                    nn.ConvTranspose2d(in_channels=128, out_channels=64, kernel_size=3,stride=1, padding=1),
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64), 
+                    nn.ConvTranspose2d(in_channels=64, out_channels=64, kernel_size=3,stride=1, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.BatchNorm2d(64), 
+                    nn.Upsample(scale_factor=2, mode='nearest'),
+                    nn.ConvTranspose2d(in_channels=64, out_channels=3, kernel_size=3,stride=1, padding=1),
+                )
+        
+
+    def forward(self, x):
+        b, seq_len, _, h, w = x.size()
+        
+        h1, c1 = self.convlstm1.init_hidden(b, (8, 8)) # Adjust the size as per the VGG19 output
+        h2, c2 = self.convlstm2.init_hidden(b, (8, 8))
+        h3, c3 = self.convlstm3.init_hidden(b, (8, 8))
+
+        output_sequence = []
+
+        for t in range(seq_len):
+            # Pass through the VGG19 spatial encoder
+            xt = self.vgg19_features(x[:, t]) 
+            #print(xt.shape)
+            # Temporal Encoder
+            h1, c1 = self.convlstm1(xt, (h1, c1))
+            h2, c2 = self.convlstm2(h1, (h2, c2))
+            h3, c3 = self.convlstm3(h2, (h3, c3))
+            
+            # Spatial Decoder 
+            xt = self.decoder(h1)
+
+            xt = torch.sigmoid(xt) 
+            output_sequence.append(xt.unsqueeze(1))
+
+        output_sequence = torch.cat(output_sequence, dim=1)
+        return output_sequence
+            
+
+model = ConvLSTM_VGG19()
+image = torch.randn(1, 10, 3, 256, 256)
+
+output = model(image)
+print(output.size())

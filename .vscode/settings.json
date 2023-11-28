@@ -1,7 +1,9 @@
 {
     "cSpell.words": [
+        "convlstm",
         "imshow",
         "optim",
-        "torchvision"
+        "torchvision",
+        "tqdm"
     ]
 }
